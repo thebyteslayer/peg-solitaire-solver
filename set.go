@@ -77,3 +77,12 @@ func (m *StateSet) has(s State) bool {
 }
 
 func (m *StateSet) len() int { return m.count }
+
+// clear empties the set while keeping its allocated capacity, so it can be
+// reused across passes without reallocating.
+func (m *StateSet) clear() {
+	for i := range m.slots {
+		m.slots[i] = State{}
+	}
+	m.count = 0
+}

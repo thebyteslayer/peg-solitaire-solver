@@ -1,0 +1,3 @@
+[submodule "solitaire-diamond"]
+	path = solitaire-diamond
+	url = https://github.com/MarkusThill/solitaire-diamond

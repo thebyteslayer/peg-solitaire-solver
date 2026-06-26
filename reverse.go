@@ -37,7 +37,7 @@ func predecessors(s State, out []State) []State {
 			continue
 		}
 		// peg at i == `to`; look for empty `over` then empty `from`.
-		for d := 0; d < 4; d++ {
+		for d := 0; d < numDirs; d++ {
 			over := nb[i][d]
 			if over < 0 || s.get(over) {
 				continue

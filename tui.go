@@ -30,9 +30,6 @@ var (
 	stPink    = lipgloss.NewStyle().Foreground(lipgloss.Color("213")).Bold(true)
 )
 
-// arrow per direction index (UP, DOWN, LEFT, RIGHT)
-var dirArrow = [4]string{"↑", "↓", "←", "→"}
-
 type tuiModel struct {
 	start       State
 	calculating bool
@@ -54,6 +51,20 @@ func newTUIModel(start State) tuiModel {
 	return tuiModel{start: start, calculating: true}
 }
 
+// newSolvedTUIModel builds a model whose solution is already known, so the TUI
+// opens straight into the replay with no "Calculating" phase.
+func newSolvedTUIModel(start State, moves []Move, elapsed time.Duration) tuiModel {
+	m := tuiModel{start: start, calculating: false, moves: moves, elapsed: elapsed}
+	m.snaps = make([]State, len(moves)+1)
+	m.snaps[0] = start
+	s := start
+	for i, mv := range moves {
+		s = applyMove(s, mv)
+		m.snaps[i+1] = s
+	}
+	return m
+}
+
 func solveCmd() tea.Msg {
 	t0 := time.Now()
 	solve()
@@ -64,7 +75,12 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
-func (m tuiModel) Init() tea.Cmd { return tea.Batch(solveCmd, tickCmd()) }
+func (m tuiModel) Init() tea.Cmd {
+	if m.calculating {
+		return tea.Batch(solveCmd, tickCmd())
+	}
+	return nil // solution already computed; go straight to replay
+}
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -155,7 +171,7 @@ func (m tuiModel) View() string {
 		mv := m.moves[m.idx-1]
 		role[mv.to] = roleLanding
 		role[mv.from] = roleFrom
-		for _, o := range mv.overs {
+		for _, o := range oversOf(mv) {
 			role[o] = roleSkipped
 		}
 		arrow = dirArrow[mv.dir]
@@ -166,8 +182,12 @@ func (m tuiModel) View() string {
 
 	// board grid
 	var grid strings.Builder
-	for r := 0; r < boardN; r++ {
-		for c := 0; c < boardN; c++ {
+	for r := 0; r < boardRows; r++ {
+		if triLayout {
+			// indent each row half a cell so the rows form a centered triangle
+			grid.WriteString(strings.Repeat(" ", boardRows-1-r))
+		}
+		for c := 0; c < boardCols; c++ {
 			id := rc2id[r][c]
 			if id < 0 {
 				grid.WriteString("  ")
@@ -217,8 +237,8 @@ func (m tuiModel) View() string {
 
 	help := stKey.Render("←/tab") + stDim.Render(" prev   ") +
 		stKey.Render("→/space") + stDim.Render(" next   ") +
-		stKey.Render("f/↑") + stDim.Render(" first   ") +
-		stKey.Render("l/↓") + stDim.Render(" last   ") +
+		stKey.Render("↑/f") + stDim.Render(" first   ") +
+		stKey.Render("↓/l") + stDim.Render(" last   ") +
 		stKey.Render("q") + stDim.Render(" quit")
 
 	content := lipgloss.JoinVertical(lipgloss.Center,
