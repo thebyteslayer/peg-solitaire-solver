@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math/bits"
 	"slices"
 	"time"
 )
@@ -79,10 +80,9 @@ func removedCount(m Move) int {
 // turn in any direction (the classic single-move-per-peg rule).
 func genCornerMoves(s State, out []Move) []Move {
 	out = out[:0]
-	for i := 0; i < nCells; i++ {
-		if s.get(i) {
-			out = cornerJumps(s, i, i, nil, out)
-		}
+	for w := uint64(s); w != 0; w &= w - 1 {
+		i := bits.TrailingZeros64(w)
+		out = cornerJumps(s, i, i, nil, out)
 	}
 	return out
 }

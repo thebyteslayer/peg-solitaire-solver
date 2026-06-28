@@ -25,28 +25,79 @@ func parseDuration(s string) (time.Duration, error) {
 
 func rcStr(id int) string { return fmt.Sprintf("(%d,%d)", id2r[id], id2c[id]) }
 
-func describeMove(m Move) string {
-	mOvers := oversOf(m)
-	overs := make([]string, len(mOvers))
-	for i, o := range mOvers {
-		overs[i] = rcStr(o)
+// rotateDir returns the direction index that dir maps to after rotating the
+// board rot quarter-turns clockwise, found via the arrow-glyph rotation so it
+// works for whatever lattice is loaded.
+func rotateDir(dir, rot int) int {
+	g := dirArrow[dir]
+	for i := 0; i < ((rot%4)+4)%4; i++ {
+		g = arrowCW[g]
 	}
-	s := fmt.Sprintf("peg %s jumps %-5s over %-13s landing %s",
-		rcStr(m.from), dirName[m.dir], strings.Join(overs, ","), rcStr(m.to))
+	for d, a := range dirArrow {
+		if a == g {
+			return d
+		}
+	}
+	return dir
+}
+
+// describeMove renders a move as a jump sequence, e.g.
+//
+//	c1 ↑UP over c2 to c3 over c4 →RIGHT over d4 on e4
+//
+// the peg starts at c1, jumps over each "over" cell to the next landing ("to")
+// and finishes at the last landing ("on"). The direction (arrow + name) is
+// printed at the start and again whenever a corner sweep changes heading.
+// Positions use algebraic coordinates and the arrows/names are rotated to match
+// the board's current render rotation.
+func describeMove(m Move, rot int) string {
+	var b strings.Builder
+	b.WriteString(stKey.Render(algLbl[m.from])) // position: bold
+
+	cur := m.from
+	dirs := m.turns
+	if dirs == nil {
+		// A straight (possibly multi-) jump: expand into one clause per hop.
+		for cur != m.to {
+			dirs = append(dirs, int8(m.dir))
+			cur = nb[nb[cur][m.dir]][m.dir]
+		}
+		cur = m.from
+	}
+	prevDir := -1
+	for i, d := range dirs {
+		if int(d) != prevDir { // show heading at the start and on every turn
+			rd := rotateDir(int(d), rot)
+			b.WriteString(" " + stKey.Render(dirArrow[rd]+dirName[rd])) // direction: bold
+			prevDir = int(d)
+		}
+		over := nb[cur][int(d)]
+		land := nb[over][int(d)]
+		conn := "to" // intermediate landing
+		if i == len(dirs)-1 {
+			conn = "on" // final landing
+		}
+		b.WriteString(stWhite.Render(" over ") + stKey.Render(algLbl[over]) +
+			stWhite.Render(" "+conn+" ") + stKey.Render(algLbl[land]))
+		cur = land
+	}
+
+	// Trailing annotation in light gray: a corner sweep if any heading changed,
+	// otherwise a straight multi-jump. Single jumps get nothing.
 	turning := false
-	for _, d := range m.turns {
-		if int(d) != m.dir {
+	for _, d := range dirs {
+		if int(d) != int(dirs[0]) {
 			turning = true
 			break
 		}
 	}
 	switch {
 	case turning:
-		s += fmt.Sprintf("   [corner sweep x%d]", len(mOvers))
-	case len(mOvers) > 1:
-		s += fmt.Sprintf("   [multi-jump x%d]", len(mOvers))
+		b.WriteString(stDim.Render(fmt.Sprintf("   [sweep x%d]", len(dirs))))
+	case len(dirs) > 1:
+		b.WriteString(stDim.Render(fmt.Sprintf("   [multi-jump x%d]", len(dirs))))
 	}
-	return s
+	return b.String()
 }
 
 func usageText() string {
@@ -59,6 +110,7 @@ func usageText() string {
 		"    asymmetrical  <size> <cut>  symmetrical, but the top row and right column dropped (default 7 2)\n" +
 		"    diamond       <radius>      staircase diamond, radius cells from center each way incl. center\n" +
 		"                                (default 5, the 41-hole diamond; cut unused)\n" +
+		"  --animation-delay MS   delay between replay animation frames in ms (default 500)\n" +
 		"  durations like 500ms, 5s\n"
 }
 
@@ -117,6 +169,10 @@ func main() {
 				}
 			} else if v, ok := flagVal(&i, a, "type"); ok {
 				typeStr = v
+			} else if v, ok := flagVal(&i, a, "animation-delay"); ok {
+				if ms := atoiOr(v, 0); ms > 0 {
+					animationDelay = time.Duration(ms) * time.Millisecond
+				}
 			} else {
 				pos = append(pos, a)
 			}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math/bits"
 	"sync/atomic"
 )
 
@@ -32,10 +33,8 @@ var backwardDB *StateSet
 
 func predecessors(s State, out []State) []State {
 	out = out[:0]
-	for i := 0; i < nCells; i++ {
-		if !s.get(i) {
-			continue
-		}
+	for w := uint64(s); w != 0; w &= w - 1 {
+		i := bits.TrailingZeros64(w)
 		// peg at i == `to`; look for empty `over` then empty `from`.
 		for d := 0; d < numDirs; d++ {
 			over := nb[i][d]

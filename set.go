@@ -1,7 +1,7 @@
 package main
 
 // StateSet is a memory-compact open-addressing hash set of States.
-// Each slot is 16 bytes (two uint64) vs ~50+ bytes/entry for a Go map, so it
+// Each slot is 8 bytes (one uint64) vs ~50+ bytes/entry for a Go map, so it
 // holds several times more states in the same RAM. The all-zero State (an
 // empty board, which never occurs as a stored position) is the empty sentinel.
 type StateSet struct {
@@ -22,11 +22,14 @@ func newStateSet(capacityHint int) *StateSet {
 	return &StateSet{slots: make([]State, cap), mask: uint64(cap - 1)}
 }
 
+// hashState is the splitmix64 finalizer applied to the 64-bit board word.
 func hashState(s State) uint64 {
-	h := s.lo*0x9E3779B97F4A7C15 ^ s.hi*0xC2B2AE3D27D4EB4F
-	h ^= h >> 29
+	h := uint64(s)
+	h ^= h >> 30
 	h *= 0xBF58476D1CE4E5B9
-	h ^= h >> 32
+	h ^= h >> 27
+	h *= 0x94D049BB133111EB
+	h ^= h >> 31
 	return h
 }
 
@@ -36,7 +39,7 @@ func (m *StateSet) grow() {
 	m.mask = uint64(len(m.slots) - 1)
 	m.count = 0
 	for _, s := range old {
-		if s.lo != 0 || s.hi != 0 {
+		if s != 0 {
 			m.add(s)
 		}
 	}
@@ -50,7 +53,7 @@ func (m *StateSet) add(s State) bool {
 	i := hashState(s) & m.mask
 	for {
 		c := m.slots[i]
-		if c.lo == 0 && c.hi == 0 {
+		if c == 0 {
 			m.slots[i] = s
 			m.count++
 			return true
@@ -66,7 +69,7 @@ func (m *StateSet) has(s State) bool {
 	i := hashState(s) & m.mask
 	for {
 		c := m.slots[i]
-		if c.lo == 0 && c.hi == 0 {
+		if c == 0 {
 			return false
 		}
 		if c == s {
@@ -82,7 +85,7 @@ func (m *StateSet) len() int { return m.count }
 // reused across passes without reallocating.
 func (m *StateSet) clear() {
 	for i := range m.slots {
-		m.slots[i] = State{}
+		m.slots[i] = 0
 	}
 	m.count = 0
 }

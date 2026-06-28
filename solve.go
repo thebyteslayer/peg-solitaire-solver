@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
+	"math/bits"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -28,7 +28,7 @@ type Move struct {
 }
 
 // oversOf reconstructs the jumped-over cells of m (used off the hot path, e.g.
-// the TUI). Hot callers (applyMove, moveDelta) walk inline to avoid allocating.
+// the TUI). The hot search never calls this — it works in precomputed jump masks.
 func oversOf(m Move) []int {
 	var ov []int
 	if m.turns == nil {
@@ -48,42 +48,95 @@ func oversOf(m Move) []int {
 	return ov
 }
 
-// genMoves returns all legal moves (including each prefix of a multi-jump) from s.
-func genMoves(s State, out []Move) []Move {
-	out = out[:0]
+// jump is a fully precomputed straight move (a single jump or a chain of jumps
+// in one direction, counted as one move). Every per-cell geometry decision is
+// baked in at board-build time so the hot search touches only bitboard words:
+//
+//   - legal in state s  <=>  (s & needSet) == needSet  &&  (s & needClear) == 0
+//     (needSet = the jumped-over pegs; needClear = the cells landed on, which
+//     must all be empty — including the intermediate ones a chain passes through)
+//   - apply             <=>  s ^ applyMask
+//     (applyMask = from | jumped-overs | final-landing: XOR clears the source and
+//     every captured peg and lights the destination in one instruction)
+//   - delta is the move's change in total distance-to-center, precomputed for the
+//     ordering heuristic so no walk is needed per node.
+//
+// Pointers to these (immutable, board-global) structs are what the search shuffles
+// and sorts, so the move-scratch buffers are 8-byte words, not 48-byte Moves.
+type jump struct {
+	needSet   State
+	needClear State
+	applyMask State
+	delta     int16
+	from      uint8
+	dir       uint8
+	to        uint8
+}
+
+// jumpsFrom[i] lists every straight move whose moving peg starts on cell i,
+// ordered by direction then increasing chain length.
+var jumpsFrom [][]jump
+
+// buildJumpTables enumerates every straight move on the board once. Requires nb
+// and dist to be populated, so initBoardSpec calls it last.
+func buildJumpTables() {
+	jumpsFrom = make([][]jump, nCells)
 	for i := 0; i < nCells; i++ {
-		if !s.get(i) {
-			continue
-		}
 		for d := 0; d < numDirs; d++ {
+			var needSet, needClear State
+			distSum := 0 // sum of dist over the captured pegs so far
 			cur := i
 			for {
 				over := nb[cur][d]
-				if over < 0 || !s.get(over) {
+				if over < 0 {
 					break
 				}
 				land := nb[over][d]
-				if land < 0 || s.get(land) {
+				if land < 0 {
 					break
 				}
-				out = append(out, Move{from: i, dir: d, to: land})
+				needSet.set(over)
+				needClear.set(land)
+				distSum += dist[over]
+				applyMask := needSet // overs...
+				applyMask.set(i)     // ...plus the source...
+				applyMask.set(land)  // ...plus the destination
+				jumpsFrom[i] = append(jumpsFrom[i], jump{
+					needSet:   needSet,
+					needClear: needClear,
+					applyMask: applyMask,
+					delta:     int16(dist[land] - dist[i] - distSum),
+					from:      uint8(i),
+					dir:       uint8(d),
+					to:        uint8(land),
+				})
 				cur = land
+			}
+		}
+	}
+}
+
+// genJumps appends a *jump for every legal straight move from s. It walks only
+// the set bits (pegs) of the bitboard and tests each candidate with two bitwise
+// ops — no geometry walk, no allocation. The emitted pointers index the global
+// jump table, so they stay valid no matter how `out` is later reused.
+func genJumps(s State, out []*jump) []*jump {
+	out = out[:0]
+	for w := uint64(s); w != 0; w &= w - 1 {
+		js := jumpsFrom[bits.TrailingZeros64(w)]
+		for k := range js {
+			j := &js[k]
+			if (s&j.needSet) == j.needSet && (s&j.needClear) == 0 {
+				out = append(out, j)
 			}
 		}
 	}
 	return out
 }
 
-// moveDelta is the change in total distance-to-center caused by a move.
-func moveDelta(m Move) int {
-	d := dist[m.to] - dist[m.from]
-	for cur := m.from; cur != m.to; {
-		over := nb[cur][m.dir]
-		d -= dist[over]
-		cur = nb[over][m.dir]
-	}
-	return d
-}
+// moveOf converts a hot-path jump back into the public Move type (used only when
+// recording a solution, never inside the search).
+func moveOf(j *jump) Move { return Move{from: int(j.from), dir: int(j.dir), to: int(j.to)} }
 
 func applyMove(s State, m Move) State {
 	s.clr(m.from)
@@ -117,22 +170,68 @@ var (
 )
 
 // searcher holds all per-goroutine search state so workers never share mutable
-// data (the backward DB is read-only once built, so it is shared safely).
+// data (the backward DB is read-only once built, so it is shared safely). Node
+// and min-peg counters are kept *local* and flushed to the shared atomics only
+// at status checkpoints — writing the globals every node would bounce their
+// cache lines between cores and throttle parallel scaling.
 type searcher struct {
-	failed *StateSet
-	rng    *rand.Rand
-	path   []Move // moves on the current DFS branch
-	buf    []Move // per-depth move scratch: depth d uses buf[d*moveCap:(d+1)*moveCap]
+	failed     *StateSet
+	rng        uint64  // xorshift64 state (cheaper than math/rand in the shuffle)
+	path       []Move  // moves on the current DFS branch (public form, for output)
+	buf        []*jump // per-depth scratch: depth d uses buf[d*moveCap:(d+1)*moveCap]
+	localNodes int64   // positions expanded by this worker (flushed in batches)
+	localMin   int     // fewest pegs this worker has seen
 }
 
-const moveCap = 256
+const (
+	moveCap   = 256
+	nodeBatch = 1 << 19 // flush local node count to the global every this many
+)
 
 func newSearcher(seed int64) *searcher {
-	return &searcher{
-		failed: newStateSet(1 << 16),
-		rng:    rand.New(rand.NewSource(seed)),
-		buf:    make([]Move, (nCells+2)*moveCap),
+	// splitmix64 the seed so the xorshift state starts well mixed and nonzero.
+	z := uint64(seed) + 0x9E3779B97F4A7C15
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	z ^= z >> 31
+	if z == 0 {
+		z = 1
 	}
+	return &searcher{
+		failed:   newStateSet(1 << 16),
+		rng:      z,
+		buf:      make([]*jump, (nCells+2)*moveCap),
+		localMin: nCells,
+	}
+}
+
+// rngn returns a fast pseudo-random int in [0,n) for move-order tie-breaking.
+// Exact uniformity is irrelevant here (it only diversifies workers), so a plain
+// modulo on the xorshift output is fine and far cheaper than math/rand.
+func (w *searcher) rngn(n int) int {
+	x := w.rng
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	w.rng = x
+	return int(x % uint64(n))
+}
+
+// flushMin publishes this worker's fewest-pegs-seen into the shared minimum.
+func (w *searcher) flushMin() {
+	for {
+		mp := atomic.LoadInt64(&minPegs)
+		if int64(w.localMin) >= mp || atomic.CompareAndSwapInt64(&minPegs, mp, int64(w.localMin)) {
+			return
+		}
+	}
+}
+
+// flushTail publishes the node count left over since the last batch checkpoint
+// (plus the latest min) so the shared totals are exact once the worker exits.
+func (w *searcher) flushTail() {
+	atomic.AddInt64(&nodes, w.localNodes&(nodeBatch-1))
+	w.flushMin()
 }
 
 // task is one root subtree to search: explore from `state`, reached via `prefix`.
@@ -183,6 +282,7 @@ func defaultSearch() bool {
 		go func(seed int64) {
 			defer wg.Done()
 			w := newSearcher(seed)
+			defer w.flushTail() // publish this worker's leftover node/min counts
 			for t := range taskCh {
 				if atomic.LoadInt32(&stopFlag) != 0 {
 					return
@@ -221,15 +321,12 @@ func buildTasks(start State, target int) []task {
 	}
 	seen := map[State]bool{canon(start): true}
 	frontier := []node{{start, nil}}
-	var buf [moveCap]Move
+	var buf [moveCap]*jump
 	for len(frontier) < target {
 		var next []node
 		for _, nd := range frontier {
-			moves := genMoves(nd.s, buf[:0])
-			mv := make([]Move, len(moves))
-			copy(mv, moves)
-			for _, m := range mv {
-				ns := applyMove(nd.s, m)
+			for _, j := range genJumps(nd.s, buf[:0]) {
+				ns := nd.s ^ j.applyMask
 				if ns.count() <= maxPegsDB {
 					// Already in endgame territory; keep this node itself as a
 					// task rather than descending into the DB-decided region.
@@ -242,7 +339,7 @@ func buildTasks(start State, target int) []task {
 				seen[cf] = true
 				p := make([]Move, len(nd.path)+1)
 				copy(p, nd.path)
-				p[len(nd.path)] = m
+				p[len(nd.path)] = moveOf(j)
 				next = append(next, node{ns, p})
 			}
 		}
@@ -265,17 +362,14 @@ func tailSolve(s State) []Move {
 	if s == goalSt {
 		return nil
 	}
-	var buf [moveCap]Move
-	moves := genMoves(s, buf[:0])
-	mv := make([]Move, len(moves))
-	copy(mv, moves)
-	for _, m := range mv {
-		ns := applyMove(s, m)
+	var buf [moveCap]*jump
+	for _, j := range genJumps(s, buf[:0]) {
+		ns := s ^ j.applyMask
 		if ns != goalSt && !backwardDB.has(canon(ns)) {
 			continue
 		}
 		if tail := tailSolve(ns); tail != nil || ns == goalSt {
-			return append([]Move{m}, tail...)
+			return append([]Move{moveOf(j)}, tail...)
 		}
 	}
 	return nil
@@ -295,58 +389,56 @@ func (w *searcher) dfs(s State, depth int) bool {
 		return false
 	}
 
-	n := atomic.AddInt64(&nodes, 1)
-	for {
-		mp := atomic.LoadInt64(&minPegs)
-		if int64(pc) >= mp || atomic.CompareAndSwapInt64(&minPegs, mp, int64(pc)) {
-			break
-		}
+	w.localNodes++
+	if pc < w.localMin {
+		w.localMin = pc
 	}
-	if n&0x7FFFF == 0 {
+	if w.localNodes&(nodeBatch-1) == 0 {
+		// Periodic checkpoint: publish this batch to the shared counters (so the
+		// TUI sees progress) and check the global stop flag. Doing this once per
+		// batch instead of per node keeps the hot path off the shared cache lines.
+		atomic.AddInt64(&nodes, nodeBatch)
+		w.flushMin()
 		if atomic.LoadInt32(&stopFlag) != 0 {
 			return false
 		}
 		setStatus(fmt.Sprintf("searching — %d positions explored, fewest pegs so far %d",
-			n, atomic.LoadInt64(&minPegs)))
+			atomic.LoadInt64(&nodes), atomic.LoadInt64(&minPegs)))
 	}
 	if w.failed.has(cf) {
 		return false
 	}
 
 	out := w.buf[depth*moveCap : depth*moveCap+moveCap]
-	moves := genMoves(s, out[:0])
+	moves := genJumps(s, out[:0])
 	if len(moves) == 0 {
 		w.failed.add(cf)
 		return false
 	}
 	// Heuristic: a central-game solution funnels pegs toward the middle. Prefer
-	// moves that decrease the board's total distance-to-center the most (delta =
-	// dist(to) - dist(from) - sum dist(overs)). A small random shuffle breaks
-	// ties and keeps workers from retracing identical barren branches.
+	// moves that decrease the board's total distance-to-center the most (delta is
+	// precomputed in the jump). A small random shuffle breaks ties and keeps
+	// workers from retracing identical barren branches.
 	nm := len(moves)
 	for i := nm - 1; i > 0; i-- {
-		j := w.rng.Intn(i + 1)
+		j := w.rngn(i + 1)
 		moves[i], moves[j] = moves[j], moves[i]
 	}
-	var dl [moveCap]int
-	for i := 0; i < nm; i++ {
-		dl[i] = moveDelta(moves[i])
-	}
-	// Stable insertion sort by delta (typed, no reflection; nm is small).
+	// Stable insertion sort by precomputed delta (typed, no reflection; nm small).
 	for i := 1; i < nm; i++ {
-		m, d := moves[i], dl[i]
+		m := moves[i]
 		j := i - 1
-		for j >= 0 && dl[j] > d {
-			moves[j+1], dl[j+1] = moves[j], dl[j]
+		for j >= 0 && moves[j].delta > m.delta {
+			moves[j+1] = moves[j]
 			j--
 		}
-		moves[j+1], dl[j+1] = m, d
+		moves[j+1] = m
 	}
 
 	for i := 0; i < nm; i++ {
-		m := moves[i]
-		ns := applyMove(s, m)
-		w.path = append(w.path, m)
+		j := moves[i]
+		ns := s ^ j.applyMask
+		w.path = append(w.path, moveOf(j))
 		if w.dfs(ns, depth+1) {
 			return true
 		}
